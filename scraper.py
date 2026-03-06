@@ -124,6 +124,7 @@ class ASPNetSession:
             "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
         })
         self._asp_fields = {}
+        self._form_defaults = {}
 
     def _extract_asp_fields(self, soup: BeautifulSoup):
         """Estrae ViewState, EventValidation, ecc."""
@@ -134,17 +135,45 @@ class ASPNetSession:
             if tag:
                 self._asp_fields[name] = tag.get("value", "")
 
+    def _capture_all_form_defaults(self, soup: BeautifulSoup):
+        """Cattura TUTTI i valori di default del form (hidden + select + text).
+        
+        ASP.NET WebForms è molto sensibile: se manca un campo nel POST,
+        il server può ignorare la richiesta. Catturiamo tutto dalla pagina
+        iniziale e lo usiamo come base per ogni POST successivo.
+        """
+        self._form_defaults = {}
+        for tag in soup.find_all(["input", "select"]):
+            name = tag.get("name", "")
+            if not name or name.startswith("__"):
+                continue
+            if tag.name == "select":
+                # Prendi il valore selezionato o il primo option
+                selected = tag.find("option", selected=True)
+                if selected:
+                    self._form_defaults[name] = selected.get("value", "")
+                else:
+                    first_opt = tag.find("option")
+                    if first_opt:
+                        self._form_defaults[name] = first_opt.get("value", "")
+            elif tag.get("type") in ("text", "hidden"):
+                self._form_defaults[name] = tag.get("value", "")
+            # Skip submit/image/checkbox (vanno inviati esplicitamente)
+
     def _base_form(self) -> dict:
-        """Campi ASP.NET base per ogni POST"""
-        return {k: v for k, v in self._asp_fields.items()}
+        """Campi ASP.NET base + TUTTI i default del form per ogni POST"""
+        data = dict(self._form_defaults)  # tutti i default catturati dalla pagina
+        data.update(self._asp_fields)     # ViewState, EventValidation, ecc.
+        return data
 
     def get_page(self, url: str = BASE_URL) -> BeautifulSoup:
-        """GET iniziale per ottenere ViewState"""
+        """GET iniziale: ottiene ViewState e cattura tutti i campi form"""
         log.info(f"GET {url}")
         resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         self._extract_asp_fields(soup)
+        self._capture_all_form_defaults(soup)
         return soup
 
     def post(self, form_data: dict, url: str = BASE_URL) -> BeautifulSoup:
@@ -161,49 +190,45 @@ class ASPNetSession:
                event_type: str = "", date_from: str = "", date_to: str = "",
                provider_name: str = "", objective: str = "",
                event_id: str = "", provider_id: str = "") -> BeautifulSoup:
-        """Esegue una ricerca compilando il form"""
-        form = {}
+        """Esegue una ricerca compilando il form.
+        
+        CRITICO: il server ASP.NET richiede TUTTI i campi del form,
+        inclusi hidden fields e dropdown con valori di default.
+        """
+        P = FORM_PREFIX  # shorthand
 
-        if title:
-            form[f"{FORM_PREFIX}tbTitoloEvento"] = title
-        if profession:
-            val = PROFESSIONS.get(profession, profession)
-            form[f"{FORM_PREFIX}ddlProfessione"] = val
-        else:
-            form[f"{FORM_PREFIX}ddlProfessione"] = "-1"
-        if region:
-            val = REGIONS.get(region, region)
-            form[f"{FORM_PREFIX}ddlRegioni"] = val
-        else:
-            form[f"{FORM_PREFIX}ddlRegioni"] = "-1"
-        if event_type:
-            val = EVENT_TYPES.get(event_type, event_type)
-            form[f"{FORM_PREFIX}ddlTipologiaEvento"] = val
-        else:
-            form[f"{FORM_PREFIX}ddlTipologiaEvento"] = "0"
-        if date_from:
-            form[f"{FORM_PREFIX}tbDataInizio"] = date_from
-        if date_to:
-            form[f"{FORM_PREFIX}tbDataFine"] = date_to
-        if provider_name:
-            form[f"{FORM_PREFIX}tbDenominazioneProvider"] = provider_name
-        if objective:
-            form[f"{FORM_PREFIX}ddlObiettivoFormativo"] = objective
-        else:
-            form[f"{FORM_PREFIX}ddlObiettivoFormativo"] = "-1"
-        if event_id:
-            form[f"{FORM_PREFIX}tbIDEvento"] = event_id
-        if provider_id:
-            form[f"{FORM_PREFIX}tbIDProvider"] = provider_id
+        form = {
+            # ── Hidden fields obbligatori ──
+            "ctl00$hfRicercaAVanzata": "False",
+            "ctl00$hfProviderAvanzata": "False",
+            "ctl00$hfRicercaAvanzata1": "False",
+            "ctl00$hfProviderAvanzata1": "False",
+            f"{P}hidCerca": "",
+            f"{P}hidprezzo": "0",
+            f"{P}hfCrediti": "0",
+            "ctl00$txtsearch": "",
 
-        # Dropdown disciplina e province (vuoti di default)
-        form[f"{FORM_PREFIX}ddlDisciplina"] = ""
-        form[f"{FORM_PREFIX}ddlProvince"] = ""
-        form[f"{FORM_PREFIX}ddlComune"] = ""
-        form[f"{FORM_PREFIX}ddlNazione"] = "-1"
+            # ── Campi testo ──
+            f"{P}tbDenominazioneProvider": provider_name,
+            f"{P}tbTitoloEvento": title,
+            f"{P}tbIDEvento": event_id,
+            f"{P}tbIDProvider": provider_id,
+            f"{P}tbDataInizio": date_from,
+            f"{P}tbDataFine": date_to,
 
-        # Bottone Cerca
-        form[f"{FORM_PREFIX}btnCerca"] = "Cerca"
+            # ── Dropdown (default = "non selezionato") ──
+            f"{P}ddlProfessione": PROFESSIONS.get(profession, profession) if profession else "-1",
+            f"{P}ddlDisciplina": "",
+            f"{P}ddlRegioni": REGIONS.get(region, region) if region else "-1",
+            f"{P}ddlTipologiaEvento": EVENT_TYPES.get(event_type, event_type) if event_type else "0",
+            f"{P}ddlObiettivoFormativo": objective if objective else "-1",
+            f"{P}ddlProvince": "",
+            f"{P}ddlComune": "",
+            f"{P}ddlNazione": "-1",
+
+            # ── Bottone Cerca ──
+            f"{P}btnCerca": "Cerca",
+        }
 
         log.info(f"POST ricerca: title='{title}' prof='{profession}' "
                  f"region='{region}' type='{event_type}' "
