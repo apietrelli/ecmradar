@@ -293,6 +293,18 @@ class ECMParser:
         events = []
         items = soup.find_all("div", class_="lista")
 
+        if not items:
+            # Diagnostic: log what div classes exist to spot HTML structure changes
+            all_divs = soup.find_all("div", class_=True)
+            classes_found = set()
+            for d in all_divs:
+                for c in d.get("class", []):
+                    classes_found.add(c)
+            log.warning(f"Nessun div.lista trovato. Classi div presenti: {sorted(classes_found)[:30]}")
+            # Also check if there's an error or no-results message
+            body_text = soup.get_text(" ", strip=True)[:500]
+            log.warning(f"Testo pagina (primi 500 char): {body_text}")
+
         for idx, item in enumerate(items):
             event = ECMEvent(scraped_at=datetime.now().isoformat(), _result_index=idx)
 
@@ -740,7 +752,14 @@ class ECMScraper:
             # 3. Prima pagina risultati
             total_count = self.parser.get_result_count(result_soup)
             total_pages = self.parser.get_total_pages(result_soup)
-            log.info(f"Risultati: {total_count}, Pagine stimate: {total_pages}")
+            log.info(f"Risultati dal server: {total_count}, Pagine stimate: {total_pages}")
+            if total_count == 0 or total_count is None:
+                log.warning("Il server ha risposto con 0 risultati: controlla i parametri di ricerca "
+                            "(codice regione, nome campo form, valori dropdown)")
+                # Save debug HTML if total is 0
+                debug_file = Path("debug_response.html")
+                debug_file.write_text(str(result_soup), encoding="utf-8")
+                log.warning(f"HTML risposta salvato in: {debug_file.resolve()}")
 
             events = self.parser.parse_search_results(result_soup)
             all_events.extend(events)
@@ -844,6 +863,8 @@ if __name__ == "__main__":
     parser.add_argument("--provider-id", default="", help="ID specifico provider")
     parser.add_argument("--details", action="store_true", help="Carica pagine dettaglio")
     parser.add_argument("--db", default="ecm_database.db", help="Path database")
+    parser.add_argument("--save-html", metavar="FILE", default="",
+                        help="Salva l'HTML della risposta di ricerca in FILE per debug")
 
     args = parser.parse_args()
 
@@ -863,6 +884,18 @@ if __name__ == "__main__":
         "provider_id": args.provider_id,
     }
     search_params = {k: v for k, v in search_params.items() if v}
+
+    if args.save_html:
+        # Modalità debug: GET + POST ricerca e salva l'HTML senza scraping completo
+        scraper.asp.get_page()
+        result_soup = scraper.asp.search(**search_params)
+        Path(args.save_html).write_text(str(result_soup), encoding="utf-8")
+        count = ECMParser.get_result_count(result_soup)
+        items = result_soup.find_all("div", class_="lista")
+        print(f"Risultati server: {count}, div.lista trovati: {len(items)}")
+        print(f"HTML salvato in: {Path(args.save_html).resolve()}")
+        db.close()
+        raise SystemExit(0)
 
     events = scraper.scrape_search(search_params, fetch_details=args.details)
     stats = db.get_stats()
