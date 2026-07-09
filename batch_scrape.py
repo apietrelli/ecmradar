@@ -20,12 +20,17 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from scraper import ECMScraper, ECMDatabase
+from scraper import (ECMScraper, ECMDatabase,
+                     PROFESSIONS as SCRAPER_PROFESSIONS,
+                     REGIONS as SCRAPER_REGIONS,
+                     EVENT_TYPES as SCRAPER_EVENT_TYPES)
 
 log = logging.getLogger("ecm_batch")
 
-# Professioni principali (valore dropdown AGENAS)
-PROFESSIONS = [
+# Professioni principali su cui iterare (sottoinsieme curato).
+# I nomi DEVONO esistere nel dizionario dropdown dello scraper:
+# la verifica sotto elimina eventuali voci divergenti.
+_PRIORITY_PROFESSIONS = [
     "Medico Chirurgo",
     "Farmacista",
     "Infermiere",
@@ -38,17 +43,14 @@ PROFESSIONS = [
     "Tecnico Sanitario Di Radiologia Medica",
     "Tutte Le Professioni",
 ]
+PROFESSIONS = [p for p in _PRIORITY_PROFESSIONS if p in SCRAPER_PROFESSIONS]
+for _p in set(_PRIORITY_PROFESSIONS) - set(PROFESSIONS):
+    log.warning(f"Professione '{_p}' non presente in scraper.PROFESSIONS: ignorata")
 
-REGIONS = [
-    "Piemonte", "Valle D'aosta", "Lombardia",
-    "Provincia Autonoma Bolzano", "Provincia Autonoma Trento",
-    "Veneto", "Friuli-Venezia Giulia", "Liguria", "Emilia-Romagna",
-    "Toscana", "Umbria", "Marche", "Lazio",
-    "Abruzzo", "Molise", "Campania", "Puglia",
-    "Basilicata", "Calabria", "Sicilia", "Sardegna",
-]
-
-EVENT_TYPES = ["FAD", "RES", "FSC", "Blended"]
+# Regioni e tipologie: derivate direttamente dai dizionari dello scraper
+# (un'unica fonte di verità per i valori dropdown AGENAS)
+REGIONS = list(SCRAPER_REGIONS)
+EVENT_TYPES = list(SCRAPER_EVENT_TYPES)
 
 
 def generate_date_ranges(year: int) -> list[tuple[str, str]]:

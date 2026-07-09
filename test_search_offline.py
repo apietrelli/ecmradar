@@ -7,6 +7,8 @@ Verifica con HTML di fixture che:
 3. il bottone Cerca viene individuato e inviato secondo il suo tipo
 4. il parser estrae correttamente i risultati (div.lista)
 5. la paginazione trova il bottone reale della pagina N
+6. il click dettaglio e il ritorno alla lista trovano i bottoni reali
+   anche se il prefisso ASP.NET cambia
 
 Uso:
     python test_search_offline.py
@@ -87,6 +89,9 @@ RESULTS_PAGE = """
   </div>
 </div>
 
+<input type="image" name="ctl00$cphMain$Eventi1$ResultTable$ctrl0$ibDettaglioEvento" src="dettaglio.png" />
+<input type="image" name="ctl00$cphMain$Eventi1$ResultTable$ctrl1$ibDettaglioEvento" src="dettaglio.png" />
+
 <div id="cphMain_Eventi1_pnlPaginazione">
   <input type="submit" name="ctl00$cphMain$Eventi1$DataPager1$ctl01$ctl00" value="1" />
   <input type="submit" name="ctl00$cphMain$Eventi1$DataPager1$ctl01$ctl01" value="2" />
@@ -95,6 +100,23 @@ RESULTS_PAGE = """
 </form>
 </body></html>
 """
+
+
+# ── FIXTURE: pagina dettaglio evento ──────────────────────────────────────────
+DETAIL_PAGE = """
+<html><body>
+<form action="./DettaglioEvento.aspx" method="post">
+<input type="hidden" name="__VIEWSTATE" value="dettaglio789" />
+<span id="cphMain_DettaglioEvento_lbNumeroEventoValore">123456</span>
+<a id="cphMain_DettaglioEvento_ibIndietro"
+   href="javascript:__doPostBack('ctl00$cphMain$DettaglioEvento$ibIndietro','')">Indietro</a>
+</form>
+</body></html>
+"""
+
+# Stessa pagina dettaglio con prefisso diverso
+DETAIL_PAGE_NEW_PREFIX = DETAIL_PAGE.replace(
+    "ctl00$cphMain$DettaglioEvento$", "ctl00$NuovoMain$Dettaglio2$")
 
 
 def make_session(html: str) -> ASPNetSession:
@@ -176,6 +198,40 @@ def test_pagination_button_lookup():
     print("✓ test_pagination_button_lookup")
 
 
+def test_click_detail_button_lookup():
+    """click_detail deve trovare il bottone image reale, anche con prefisso diverso"""
+    new_prefix_page = RESULTS_PAGE.replace(
+        "ctl00$cphMain$Eventi1$", "ctl00$NuovoMain$Ricerca2$")
+    asp = make_session(new_prefix_page)
+    captured = {}
+
+    def fake_post(form, url=None):
+        captured.update(form)
+        return asp.last_soup
+    asp.post = fake_post
+
+    asp.click_detail(1)
+    target = "ctl00$NuovoMain$Ricerca2$ResultTable$ctrl1$ibDettaglioEvento"
+    assert captured["__EVENTTARGET"] == target
+    assert captured[f"{target}.x"] == "10"
+    print("✓ test_click_detail_button_lookup")
+
+
+def test_click_back_lookup():
+    """click_back_to_results deve trovare il link Indietro reale nella pagina"""
+    asp = make_session(DETAIL_PAGE_NEW_PREFIX)
+    captured = {}
+
+    def fake_post(form, url=None):
+        captured.update(form)
+        return asp.last_soup
+    asp.post = fake_post
+
+    asp.click_back_to_results()
+    assert captured["__EVENTTARGET"] == "ctl00$NuovoMain$Dettaglio2$ibIndietro"
+    print("✓ test_click_back_lookup")
+
+
 def test_results_as_dicts():
     """I risultati devono essere convertibili in dict usabili (come search_events)"""
     from dataclasses import asdict
@@ -199,5 +255,7 @@ if __name__ == "__main__":
     test_field_resolution_changed_prefix()
     test_parse_results()
     test_pagination_button_lookup()
+    test_click_detail_button_lookup()
+    test_click_back_lookup()
     test_results_as_dicts()
     print("\nTutti i test offline superati ✓")

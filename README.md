@@ -35,7 +35,7 @@ ecmradar/
 ├── profiler.py         # 15+ query analitiche + CLI interattiva
 ├── export.py           # Export CSV/Excel (7 fogli/tabelle)
 ├── inspect_fields.py   # Calibrazione campi ASP.NET (una tantum)
-├── test_pipeline.py    # Test end-to-end con dati simulati
+├── test_search_offline.py # Test offline (parsing + calibrazione, senza rete)
 ├── ECMRadar_Colab.ipynb # Notebook Google Colab pronto
 ├── requirements.txt
 └── README.md

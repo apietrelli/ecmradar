@@ -4,29 +4,33 @@ ECM Field Inspector
 Utility per ispezionare i nomi reali dei campi ASP.NET sulla pagina AGENAS.
 Da eseguire UNA VOLTA per calibrare il mapping dei campi nello scraper.
 
+Usa la stessa ASPNetSession dello scraper (flusso cookie a due step),
+così la pagina ispezionata è identica a quella che lo scraper vede
+realmente durante la ricerca — non la versione con il banner cookie.
+
 Uso:
     python inspect_fields.py
     python inspect_fields.py --save
 """
 
-import requests
-from bs4 import BeautifulSoup
 import json
 import sys
 
-BASE_URL = "https://ape.agenas.it/Tools/Eventi.aspx"
+from scraper import ASPNetSession, BASE_URL, FORM_PREFIX
+
+
+# Campi chiave usati dallo scraper: la risoluzione per suffisso deve trovarli
+KEY_FIELDS = [
+    "tbTitoloEvento", "tbDenominazioneProvider", "tbIDEvento", "tbIDProvider",
+    "tbDataInizio", "tbDataFine",
+    "ddlProfessione", "ddlRegioni", "ddlTipologiaEvento", "ddlObiettivoFormativo",
+]
+
 
 def inspect():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-    })
-
-    print(f"Fetching {BASE_URL}...")
-    resp = session.get(BASE_URL, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    asp = ASPNetSession()
+    print(f"Fetching {BASE_URL} (con flusso cookie a due step)...")
+    soup = asp.get_page()
 
     print(f"\n{'='*70}")
     print("CAMPI INPUT (name → type, id)")
@@ -63,14 +67,30 @@ def inspect():
         value = tag.get("value", "")[:80]
         print(f"  {name} = {value}...")
 
-    # Bottoni
+    # Bottoni (come catturati dalla sessione dello scraper)
     print(f"\n{'='*70}")
-    print("BOTTONI")
+    print("BOTTONI (catturati da ASPNetSession)")
     print(f"{'='*70}")
-    for tag in soup.find_all(["input", "button"], {"type": ["submit", "button"]}):
-        name = tag.get("name", "")
-        value = tag.get("value", tag.get_text(strip=True))
-        print(f"  {name} = {value}")
+    for name, info in asp._buttons.items():
+        print(f"  {name} = {info.get('value', '')} [{info.get('type', '')}]")
+
+    # Verifica risoluzione dei campi chiave usati dallo scraper
+    print(f"\n{'='*70}")
+    print("RISOLUZIONE CAMPI CHIAVE (suffisso → nome reale)")
+    print(f"{'='*70}")
+    resolution = {}
+    for suffix in KEY_FIELDS:
+        resolved = asp._resolve_field(suffix, "(NON TROVATO)")
+        resolution[suffix] = resolved
+        marker = "✓" if resolved != "(NON TROVATO)" else "✗"
+        print(f"  {marker} {suffix:30s} → {resolved}")
+    btn_name, btn_kind = asp._find_search_button()
+    resolution["btnCerca"] = btn_name
+    print(f"  {'✓' if btn_name else '✗'} {'btnCerca':30s} → {btn_name} [{btn_kind}]")
+    if any(v == "(NON TROVATO)" for v in resolution.values()):
+        print(f"\n  ⚠ Alcuni campi non sono stati trovati: la struttura del sito")
+        print(f"    è cambiata oltre il prefisso (attuale: {FORM_PREFIX}).")
+        print(f"    Aggiorna i suffissi in scraper.py → ASPNetSession.search().")
 
     # Tabelle (per capire la struttura risultati)
     print(f"\n{'='*70}")
@@ -100,6 +120,8 @@ def inspect():
         output = {
             "url": BASE_URL,
             "fields": fields,
+            "buttons": asp._buttons,
+            "key_field_resolution": resolution,
         }
         with open("field_mapping.json", "w") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
