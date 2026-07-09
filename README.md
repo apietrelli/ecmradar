@@ -58,6 +58,10 @@ Il DB e gli export finiscono su Google Drive (`/MyDrive/ECMRadar/`).
 ```bash
 pip install -r requirements.txt
 
+# 0. Verifica che la ricerca keyword funzioni (diagnostica end-to-end)
+python scraper.py --selftest              # usa la keyword "diabete"
+python scraper.py --selftest oncologia    # keyword custom
+
 # 1. Calibra i campi ASP.NET (una volta sola)
 python inspect_fields.py --save
 
@@ -78,6 +82,43 @@ python export.py --format both
 python profiler.py top-sponsors
 python profiler.py kol gastroenterologia
 ```
+
+## Ricerca per keyword (API semplice)
+
+Per usare i risultati direttamente in Python senza passare dal database:
+
+```python
+from scraper import search_events
+
+results = search_events("diabete", region="Lombardia", max_pages=2)
+for r in results:
+    print(r["event_id"], r["title"], r["credits"], r["event_type"])
+```
+
+Oppure da riga di comando, con output JSON:
+
+```bash
+python scraper.py --title diabete --json -              # stampa su stdout
+python scraper.py --title diabete --json risultati.json # salva su file
+```
+
+### Se la ricerca non restituisce risultati
+
+1. `python scraper.py --selftest` mostra passo-passo dove si rompe il flusso
+   (GET iniziale, campi form, POST ricerca, parsing).
+2. I nomi dei campi ASP.NET vengono ora **risolti automaticamente** dalla
+   pagina scaricata (match per suffisso, es. `tbTitoloEvento`), quindi il
+   codice sopravvive ai cambi di prefisso lato AGENAS. Se un campo non viene
+   trovato, il log lo segnala con un warning.
+3. Se il server ignora il POST, l'HTML della risposta viene salvato in
+   `debug_search_response.html` per l'ispezione.
+4. `python test_search_offline.py` verifica la logica di parsing e
+   calibrazione **senza rete** (utile in CI o ambienti che non raggiungono
+   ape.agenas.it).
+
+⚠️ Nota: ape.agenas.it può bloccare IP di datacenter/esteri (403). Se il
+selftest fallisce al passo 1 con un errore di rete, esegui da una connessione
+italiana residenziale o da Google Colab.
 
 ## Workflow per dump completo
 

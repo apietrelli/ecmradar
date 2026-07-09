@@ -24,7 +24,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -125,6 +125,8 @@ class ASPNetSession:
         })
         self._asp_fields = {}
         self._form_defaults = {}
+        self._buttons = {}          # name → {"type": ..., "value": ...}
+        self.last_soup: Optional[BeautifulSoup] = None
 
     def _extract_asp_fields(self, soup: BeautifulSoup):
         """Estrae ViewState, EventValidation, ecc."""
@@ -143,6 +145,7 @@ class ASPNetSession:
         iniziale e lo usiamo come base per ogni POST successivo.
         """
         self._form_defaults = {}
+        self._buttons = {}
         for tag in soup.find_all(["input", "select"]):
             name = tag.get("name", "")
             if not name or name.startswith("__"):
@@ -158,7 +161,13 @@ class ASPNetSession:
                         self._form_defaults[name] = first_opt.get("value", "")
             elif tag.get("type") in ("text", "hidden"):
                 self._form_defaults[name] = tag.get("value", "")
-            # Skip submit/image/checkbox (vanno inviati esplicitamente)
+            elif tag.get("type") in ("submit", "image", "button"):
+                # Non vanno nei default (il browser invia solo il bottone
+                # cliccato), ma li registriamo per trovarli al momento giusto
+                self._buttons[name] = {
+                    "type": tag.get("type"),
+                    "value": tag.get("value", ""),
+                }
 
     def _base_form(self) -> dict:
         """Campi ASP.NET base + TUTTI i default del form per ogni POST"""
@@ -189,17 +198,71 @@ class ASPNetSession:
         soup = BeautifulSoup(resp.text, "html.parser")
         self._extract_asp_fields(soup)
         self._capture_all_form_defaults(soup)
+        self.last_soup = soup
+
+        if "__VIEWSTATE" not in self._asp_fields:
+            log.warning("__VIEWSTATE non trovato nella pagina iniziale: "
+                        "il sito potrebbe aver cambiato struttura o bloccato la richiesta")
         return soup
 
     def post(self, form_data: dict, url: str = BASE_URL) -> BeautifulSoup:
-        """POST con ViewState"""
+        """POST con ViewState.
+
+        Dopo ogni POST ricattura i default del form dalla nuova pagina,
+        come farebbe un browser: il POST successivo invia i campi della
+        pagina corrente (inclusi i criteri di ricerca ancora compilati),
+        non quelli della pagina iniziale.
+        """
         data = self._base_form()
         data.update(form_data)
         resp = self.session.post(url, data=data, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         self._extract_asp_fields(soup)
+        self._capture_all_form_defaults(soup)
+        self.last_soup = soup
         return soup
+
+    def _resolve_field(self, suffix: str, fallback: str) -> str:
+        """Trova il nome reale di un campo cercando per suffisso tra i campi
+        catturati dalla pagina (es. 'tbTitoloEvento').
+
+        Se AGENAS cambia il prefisso ASP.NET (ctl00$cphMain$Eventi1$ → altro)
+        il campo viene comunque individuato; il fallback hardcoded si usa solo
+        se il suffisso non compare proprio nella pagina.
+        """
+        suffix_l = suffix.lower()
+        for name in self._form_defaults:
+            if name.lower().endswith(suffix_l):
+                return name
+        log.warning(f"Campo '{suffix}' non trovato nel form: uso fallback '{fallback}'")
+        return fallback
+
+    def _find_search_button(self) -> tuple[str, str]:
+        """Individua il bottone 'Cerca' reale nella pagina corrente.
+
+        Restituisce (name, kind) con kind ∈ {'submit', 'image', 'postback'}:
+        - input type=submit  → inviare name=value
+        - input type=image   → inviare name.x / name.y
+        - LinkButton (<a href="__doPostBack(...)">) → inviare __EVENTTARGET
+        """
+        for name, info in self._buttons.items():
+            if (name.lower().endswith("btncerca")
+                    or info.get("value", "").strip().lower() == "cerca"):
+                return name, info.get("type", "submit")
+
+        if self.last_soup is not None:
+            for link in self.last_soup.find_all("a", href=True):
+                href = link["href"]
+                if "__doPostBack" in href and "cerca" in (
+                        href.lower() + link.get_text(strip=True).lower()):
+                    m = re.search(r"__doPostBack\('([^']+)'", href)
+                    if m:
+                        return m.group(1), "postback"
+
+        log.warning(f"Bottone 'Cerca' non trovato nella pagina: "
+                    f"uso fallback '{FORM_PREFIX}btnCerca'")
+        return f"{FORM_PREFIX}btnCerca", "submit"
 
     def search(self, title: str = "", profession: str = "", region: str = "",
                event_type: str = "", date_from: str = "", date_to: str = "",
@@ -209,8 +272,15 @@ class ASPNetSession:
         
         CRITICO: il server ASP.NET richiede TUTTI i campi del form,
         inclusi hidden fields e dropdown con valori di default.
+        I nomi dei campi vengono risolti dinamicamente dalla pagina
+        appena scaricata (get_page), con fallback sui nomi hardcoded.
         """
-        P = FORM_PREFIX  # shorthand
+        if not self._form_defaults:
+            log.info("Nessun form catturato: eseguo get_page() automaticamente")
+            self.get_page()
+
+        P = FORM_PREFIX  # shorthand per i fallback
+        R = self._resolve_field
 
         form = {
             # ── Hidden fields obbligatori ──
@@ -218,37 +288,65 @@ class ASPNetSession:
             "ctl00$hfProviderAvanzata": "False",
             "ctl00$hfRicercaAvanzata1": "False",
             "ctl00$hfProviderAvanzata1": "False",
-            f"{P}hidCerca": "",
-            f"{P}hidprezzo": "0",
-            f"{P}hfCrediti": "0",
+            R("hidCerca", f"{P}hidCerca"): "",
+            R("hidprezzo", f"{P}hidprezzo"): "0",
+            R("hfCrediti", f"{P}hfCrediti"): "0",
             "ctl00$txtsearch": "",
 
             # ── Campi testo ──
-            f"{P}tbDenominazioneProvider": provider_name,
-            f"{P}tbTitoloEvento": title,
-            f"{P}tbIDEvento": event_id,
-            f"{P}tbIDProvider": provider_id,
-            f"{P}tbDataInizio": date_from,
-            f"{P}tbDataFine": date_to,
+            R("tbDenominazioneProvider", f"{P}tbDenominazioneProvider"): provider_name,
+            R("tbTitoloEvento", f"{P}tbTitoloEvento"): title,
+            R("tbIDEvento", f"{P}tbIDEvento"): event_id,
+            R("tbIDProvider", f"{P}tbIDProvider"): provider_id,
+            R("tbDataInizio", f"{P}tbDataInizio"): date_from,
+            R("tbDataFine", f"{P}tbDataFine"): date_to,
 
             # ── Dropdown (default = "non selezionato") ──
-            f"{P}ddlProfessione": PROFESSIONS.get(profession, profession) if profession else "-1",
-            f"{P}ddlDisciplina": "",
-            f"{P}ddlRegioni": REGIONS.get(region, region) if region else "-1",
-            f"{P}ddlTipologiaEvento": EVENT_TYPES.get(event_type, event_type) if event_type else "0",
-            f"{P}ddlObiettivoFormativo": objective if objective else "-1",
-            f"{P}ddlProvince": "",
-            f"{P}ddlComune": "",
-            f"{P}ddlNazione": "-1",
-
-            # ── Bottone Cerca ──
-            f"{P}btnCerca": "Cerca",
+            R("ddlProfessione", f"{P}ddlProfessione"):
+                PROFESSIONS.get(profession, profession) if profession else "-1",
+            R("ddlDisciplina", f"{P}ddlDisciplina"): "",
+            R("ddlRegioni", f"{P}ddlRegioni"):
+                REGIONS.get(region, region) if region else "-1",
+            R("ddlTipologiaEvento", f"{P}ddlTipologiaEvento"):
+                EVENT_TYPES.get(event_type, event_type) if event_type else "0",
+            R("ddlObiettivoFormativo", f"{P}ddlObiettivoFormativo"):
+                objective if objective else "-1",
+            R("ddlProvince", f"{P}ddlProvince"): "",
+            R("ddlComune", f"{P}ddlComune"): "",
+            R("ddlNazione", f"{P}ddlNazione"): "-1",
         }
+
+        # ── Bottone Cerca: inviato secondo il suo tipo reale ──
+        btn_name, btn_kind = self._find_search_button()
+        if btn_kind == "image":
+            form[f"{btn_name}.x"] = "10"
+            form[f"{btn_name}.y"] = "10"
+        elif btn_kind == "postback":
+            form["__EVENTTARGET"] = btn_name
+            form["__EVENTARGUMENT"] = ""
+        else:
+            form[btn_name] = self._buttons.get(btn_name, {}).get("value") or "Cerca"
 
         log.info(f"POST ricerca: title='{title}' prof='{profession}' "
                  f"region='{region}' type='{event_type}' "
-                 f"dates='{date_from}'-'{date_to}'")
-        return self.post(form)
+                 f"dates='{date_from}'-'{date_to}' (bottone: {btn_name} [{btn_kind}])")
+        soup = self.post(form)
+
+        # ── Verifica che il server abbia processato la ricerca ──
+        count = ECMParser.get_result_count(soup)
+        items = soup.find_all("div", class_="lista")
+        if count is None and not items:
+            debug_file = Path("debug_search_response.html")
+            debug_file.write_text(str(soup), encoding="utf-8")
+            log.warning(
+                "La risposta non contiene né il conteggio risultati né div.lista: "
+                "il server potrebbe aver ignorato il POST (campi form non validi?). "
+                f"HTML salvato in {debug_file.resolve()} — "
+                "esegui 'python scraper.py --selftest' per la diagnostica completa")
+        else:
+            log.info(f"Ricerca OK: {count if count is not None else '?'} risultati, "
+                     f"{len(items)} elementi in pagina")
+        return soup
 
     def navigate_page(self, page_number: int) -> BeautifulSoup:
         """Naviga alla pagina N dei risultati.
@@ -257,10 +355,25 @@ class ASPNetSession:
         ctl00$cphMain$Eventi1$DataPager1$ctl01$ctl{NN}
         dove NN è l'indice 0-based del bottone pagina (01=pag2, 02=pag3, etc.)
         """
-        # Il bottone per pagina N ha indice (N-2) nel gruppo ctl01
-        # Pagina 2 → ctl01, Pagina 3 → ctl02, ...
-        btn_index = page_number - 1  # 0-based
-        btn_name = f"{FORM_PREFIX}DataPager1$ctl01$ctl{btn_index:02d}"
+        # Cerca il bottone reale (value == numero pagina) nella pagina corrente:
+        # più robusto del calcolo dell'indice, che dipende dalla finestra
+        # di paginazione mostrata dal server
+        btn_name = None
+        if self.last_soup is not None:
+            pager = self.last_soup.find(id=re.compile(r"pnlPaginazione|DataPager", re.I))
+            if pager:
+                for btn in pager.find_all("input", {"type": "submit"}):
+                    if btn.get("value", "").strip() == str(page_number):
+                        btn_name = btn.get("name")
+                        break
+
+        if btn_name is None:
+            # Fallback: il bottone per pagina N ha indice (N-1) nel gruppo ctl01
+            # Pagina 2 → ctl01, Pagina 3 → ctl02, ...
+            btn_index = page_number - 1  # 0-based
+            btn_name = f"{FORM_PREFIX}DataPager1$ctl01$ctl{btn_index:02d}"
+            log.warning(f"Bottone pagina {page_number} non trovato nel pager: "
+                        f"uso fallback {btn_name}")
 
         form = {btn_name: str(page_number)}
         log.info(f"Navigazione pagina {page_number} ({btn_name})")
@@ -596,6 +709,50 @@ class ECMParser:
         return persons
 
 
+# ── API SEMPLICE ──────────────────────────────────────────────────────────────
+def search_events(keyword: str = "", *, profession: str = "", region: str = "",
+                  event_type: str = "", date_from: str = "", date_to: str = "",
+                  provider_name: str = "", max_pages: int = 5,
+                  delay: float = DELAY_BETWEEN_REQUESTS,
+                  session: Optional[ASPNetSession] = None) -> list[dict]:
+    """Ricerca per keyword e restituisce una lista di dict, senza toccare il DB.
+
+    Uso:
+        from scraper import search_events
+        results = search_events("diabete", region="Lombardia", max_pages=2)
+        for r in results:
+            print(r["event_id"], r["title"], r["credits"])
+
+    Ogni dict contiene i campi di ECMEvent (title, event_id, provider_name,
+    event_type, credits, cost, start_date, end_date, ...).
+    """
+    asp = session or ASPNetSession()
+    asp.get_page()
+    time.sleep(delay)
+
+    soup = asp.search(title=keyword, profession=profession, region=region,
+                      event_type=event_type, date_from=date_from,
+                      date_to=date_to, provider_name=provider_name)
+
+    events = ECMParser.parse_search_results(soup)
+    total_pages = ECMParser.get_total_pages(soup)
+
+    for page in range(2, min(total_pages, max_pages) + 1):
+        time.sleep(delay)
+        page_soup = asp.navigate_page(page)
+        page_events = ECMParser.parse_search_results(page_soup)
+        if not page_events:
+            break
+        events.extend(page_events)
+
+    results = []
+    for ev in events:
+        d = asdict(ev)
+        d.pop("_result_index", None)
+        results.append(d)
+    return results
+
+
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 class ECMDatabase:
     """SQLite con schema relazionale"""
@@ -860,6 +1017,81 @@ class ECMScraper:
                     pass
 
 
+# ── SELF-TEST ─────────────────────────────────────────────────────────────────
+def run_selftest(keyword: str = "diabete") -> bool:
+    """Verifica end-to-end che la ricerca per keyword funzioni sul sito reale.
+
+    Stampa la diagnostica passo-passo:
+    1. GET pagina iniziale → ViewState presente? Quanti campi form?
+    2. I campi chiave (tbTitoloEvento, bottone Cerca) esistono nella pagina?
+    3. POST ricerca → il server restituisce il conteggio e i div.lista?
+    4. Parsing → i risultati hanno titolo/ID/crediti?
+
+    Restituisce True se la ricerca produce risultati parsabili.
+    """
+    print(f"\n{'='*70}\nSELF-TEST ricerca keyword: '{keyword}'\n{'='*70}")
+
+    asp = ASPNetSession()
+
+    # Step 1: GET
+    print("\n[1/4] GET pagina iniziale...")
+    try:
+        asp.get_page()
+    except Exception as e:
+        print(f"  ✗ ERRORE di rete: {e}")
+        print("    → Verifica connessione / eventuale blocco IP da parte di AGENAS")
+        return False
+    vs = asp._asp_fields.get("__VIEWSTATE", "")
+    print(f"  {'✓' if vs else '✗'} __VIEWSTATE: {len(vs)} caratteri")
+    print(f"  ✓ Campi form catturati: {len(asp._form_defaults)}")
+    print(f"  ✓ Bottoni trovati: {len(asp._buttons)}")
+
+    # Step 2: risoluzione campi chiave
+    print("\n[2/4] Risoluzione campi chiave...")
+    title_field = asp._resolve_field("tbTitoloEvento", "(NON TROVATO)")
+    btn_name, btn_kind = asp._find_search_button()
+    print(f"  Campo titolo:  {title_field}")
+    print(f"  Bottone Cerca: {btn_name} [{btn_kind}]")
+    if title_field == "(NON TROVATO)":
+        print("  ✗ Il campo titolo non esiste nella pagina: struttura cambiata!")
+        print("    → Esegui 'python inspect_fields.py' e aggiorna FORM_PREFIX")
+
+    # Step 3: POST ricerca
+    print(f"\n[3/4] POST ricerca con keyword '{keyword}'...")
+    time.sleep(DELAY_BETWEEN_REQUESTS)
+    try:
+        soup = asp.search(title=keyword)
+    except Exception as e:
+        print(f"  ✗ ERRORE POST: {e}")
+        return False
+    count = ECMParser.get_result_count(soup)
+    items = soup.find_all("div", class_="lista")
+    print(f"  Conteggio server: {count}")
+    print(f"  div.lista in pagina: {len(items)}")
+    if count is None and not items:
+        print("  ✗ Il server NON ha processato la ricerca "
+              "(vedi debug_search_response.html)")
+        return False
+    if count == 0:
+        print("  ⚠ 0 risultati: la ricerca funziona ma la keyword non matcha nulla."
+              " Riprova con una keyword più comune (es. 'corso').")
+        return True
+
+    # Step 4: parsing
+    print("\n[4/4] Parsing risultati...")
+    events = ECMParser.parse_search_results(soup)
+    if not events:
+        print("  ✗ Conteggio > 0 ma parsing fallito: struttura HTML cambiata")
+        return False
+    print(f"  ✓ {len(events)} eventi parsati. Primi 3:")
+    for ev in events[:3]:
+        print(f"    - [{ev.event_id}] {ev.title!r:.70} "
+              f"crediti={ev.credits} tipo={ev.event_type}")
+
+    print(f"\n{'='*70}\n✓ SELF-TEST SUPERATO: la ricerca keyword funziona\n{'='*70}")
+    return True
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
@@ -878,8 +1110,29 @@ if __name__ == "__main__":
     parser.add_argument("--details", action="store_true", help="Carica pagine dettaglio")
     parser.add_argument("--db", default="ecm_database.db", help="Path database")
     parser.add_argument("--save-html", metavar="FILE", default="", help="Salva l'HTML della risposta di ricerca in FILE per debug")
+    parser.add_argument("--selftest", nargs="?", const="diabete", metavar="KEYWORD",
+                        help="Diagnostica end-to-end della ricerca (default keyword: diabete)")
+    parser.add_argument("--json", metavar="FILE", default="",
+                        help="Ricerca senza DB, risultati in JSON ('-' = stdout)")
 
     args = parser.parse_args()
+
+    if args.selftest is not None:
+        ok = run_selftest(args.selftest)
+        raise SystemExit(0 if ok else 1)
+
+    if args.json:
+        results = search_events(
+            args.title, profession=args.profession, region=args.region,
+            event_type=args.type, date_from=args.date_from, date_to=args.date_to,
+            provider_name=args.provider)
+        payload = json.dumps(results, indent=2, ensure_ascii=False)
+        if args.json == "-":
+            print(payload)
+        else:
+            Path(args.json).write_text(payload, encoding="utf-8")
+            print(f"{len(results)} eventi salvati in: {Path(args.json).resolve()}")
+        raise SystemExit(0)
 
     db = ECMDatabase(Path(args.db))
     scraper = ECMScraper(db)
