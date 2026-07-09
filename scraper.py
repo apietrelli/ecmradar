@@ -125,9 +125,6 @@ class ASPNetSession:
         })
         self._asp_fields = {}
         self._form_defaults = {}
-        # Accetta cookie policy automaticamente
-        # Il sito usa jQuery $.cookie("ok_cookie", "ok_cookieSetting")
-        self.session.cookies.set("ok_cookie", "ok_cookieSetting", domain="ape.agenas.it")
 
     def _extract_asp_fields(self, soup: BeautifulSoup):
         """Estrae ViewState, EventValidation, ecc."""
@@ -170,8 +167,23 @@ class ASPNetSession:
         return data
 
     def get_page(self, url: str = BASE_URL) -> BeautifulSoup:
-        """GET iniziale: ottiene ViewState e cattura tutti i campi form"""
-        log.info(f"GET {url}")
+        """GET iniziale: ottiene ViewState e cattura tutti i campi form.
+
+        Flusso cookie a due step (simula browser reale):
+        1. Primo GET senza cookie → stabilisce sessione ASP.NET
+        2. Imposta ok_cookie (simula click "Accetta" da parte dell'utente)
+        3. Secondo GET con cookie → ottiene la pagina pulita (senza banner)
+           e cattura ViewState + campi form nella versione corretta
+        """
+        log.info(f"GET {url} (step 1 – stabilisce sessione ASP.NET)")
+        resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+
+        # Simula accettazione cookie policy dopo il primo GET
+        # Il sito usa jQuery: $.cookie("ok_cookie", "ok_cookieSetting")
+        self.session.cookies.set("ok_cookie", "ok_cookieSetting", domain="ape.agenas.it")
+        log.info("Cookie ok_cookie impostato – secondo GET per ottenere form pulito")
+
         resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
