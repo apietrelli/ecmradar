@@ -384,10 +384,26 @@ class ASPNetSession:
 
         Il bottone è un input type=image con PostBack:
         ctl00$cphMain$Eventi1$ResultTable$ctrl{N}$ibDettaglioEvento
-        
+
+        Il nome reale viene cercato tra i bottoni catturati dalla pagina
+        corrente (come per il bottone Cerca e la paginazione), così il
+        click sopravvive ai cambi di prefisso ASP.NET. Il fallback
+        hardcoded si usa solo se il bottone non compare nella pagina.
+
         Per input type=image, il browser invia anche le coordinate .x e .y
         """
-        target = f"ctl00$cphMain$Eventi1$ResultTable$ctrl{result_index}$ibDettaglioEvento"
+        suffix = f"ctrl{result_index}$ibDettaglioEvento"
+        target = None
+        for name in self._buttons:
+            if name.endswith(suffix):
+                target = name
+                break
+
+        if target is None:
+            target = f"{FORM_PREFIX}ResultTable${suffix}"
+            log.warning(f"Bottone dettaglio #{result_index} non trovato nella pagina: "
+                        f"uso fallback '{target}'")
+
         form = {
             "__EVENTTARGET": target,
             "__EVENTARGUMENT": "",
@@ -402,9 +418,33 @@ class ASPNetSession:
         """Torna dalla pagina dettaglio alla lista risultati.
 
         Usa il link 'Indietro': __doPostBack('ctl00$cphMain$DettaglioEvento$ibIndietro','')
+
+        Il target reale viene cercato nella pagina dettaglio corrente
+        (bottone o link __doPostBack con suffisso 'ibIndietro'), con
+        fallback hardcoded se non compare.
         """
+        target = None
+        for name in self._buttons:
+            if name.lower().endswith("ibindietro"):
+                target = name
+                break
+
+        if target is None and self.last_soup is not None:
+            for link in self.last_soup.find_all("a", href=True):
+                href = link["href"]
+                if "__doPostBack" in href and "ibindietro" in href.lower():
+                    m = re.search(r"__doPostBack\('([^']+)'", href)
+                    if m:
+                        target = m.group(1)
+                        break
+
+        if target is None:
+            target = "ctl00$cphMain$DettaglioEvento$ibIndietro"
+            log.warning(f"Bottone 'Indietro' non trovato nella pagina dettaglio: "
+                        f"uso fallback '{target}'")
+
         form = {
-            "__EVENTTARGET": "ctl00$cphMain$DettaglioEvento$ibIndietro",
+            "__EVENTTARGET": target,
             "__EVENTARGUMENT": "",
         }
         log.info("Click Indietro → torna ai risultati")
@@ -712,7 +752,9 @@ class ECMParser:
 # ── API SEMPLICE ──────────────────────────────────────────────────────────────
 def search_events(keyword: str = "", *, profession: str = "", region: str = "",
                   event_type: str = "", date_from: str = "", date_to: str = "",
-                  provider_name: str = "", max_pages: int = 5,
+                  provider_name: str = "", objective: str = "",
+                  event_id: str = "", provider_id: str = "",
+                  max_pages: int = 5,
                   delay: float = DELAY_BETWEEN_REQUESTS,
                   session: Optional[ASPNetSession] = None) -> list[dict]:
     """Ricerca per keyword e restituisce una lista di dict, senza toccare il DB.
@@ -732,7 +774,9 @@ def search_events(keyword: str = "", *, profession: str = "", region: str = "",
 
     soup = asp.search(title=keyword, profession=profession, region=region,
                       event_type=event_type, date_from=date_from,
-                      date_to=date_to, provider_name=provider_name)
+                      date_to=date_to, provider_name=provider_name,
+                      objective=objective, event_id=event_id,
+                      provider_id=provider_id)
 
     events = ECMParser.parse_search_results(soup)
     total_pages = ECMParser.get_total_pages(soup)
@@ -1125,7 +1169,8 @@ if __name__ == "__main__":
         results = search_events(
             args.title, profession=args.profession, region=args.region,
             event_type=args.type, date_from=args.date_from, date_to=args.date_to,
-            provider_name=args.provider)
+            provider_name=args.provider, objective=args.objective,
+            event_id=args.event_id, provider_id=args.provider_id)
         payload = json.dumps(results, indent=2, ensure_ascii=False)
         if args.json == "-":
             print(payload)
